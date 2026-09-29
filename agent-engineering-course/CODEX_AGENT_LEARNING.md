@@ -3,6 +3,8 @@
 核验日期：2026-09-11。源码基线：`02a8f038b87ad34d4a1dc5058eda26972ed7aa6c`。
 首次检查工作区干净。本轮只做静态源码核验与外部资料阅读，未编译、运行 Agent 或测试。此文件是课程记录，不是 Codex 产品文档。
 
+第三课补充核验日期：2026-09-14。当前 checkout HEAD 为 c222ebe3bbc542ca7698d4eac4c73dbf4dca2e1e。第三课按当前 checkout 静态阅读 ToolInvocation、ToolCallRuntime、ToolRouter、ToolRegistry、StepContext、取消和结果持久化路径；未启动 Agent、未编译、未运行测试。上面的历史基线与前两课记录保持不变。
+
 ## 证据规则
 
 - 源码事实必须绑定本地 commit、文件和符号；更新仓库后重新定位。
@@ -151,6 +153,10 @@ Agent 工程
 注意：本轮打开的 OpenHands/OpenHands 主仓 README 已是 Agent Canvas 入口；不能沿用旧文章路径定位 Python runtime。Agents SDK 当前 README 也含 Sandbox agents，不能套用“SDK 完全没有 sandbox”的旧比较。
 
 ## Agent Engineer Progress
+
+2026-09-15 第三课练习回收：第 1 题的概念部分正确，已能指出 ToolInvocation、call_id 的关联语义以及两个 Router 阶段；尚未完成 ResponseItem、ToolCall、ToolInvocation、AnyToolResult 和持久化阶段的字段追踪。第 2、3 题暂不会作答，已补充取消窗口、外部副作用、operation_id、状态机、原子提交、版本检查和远端查询的解释。第三课已完成讲解但练习尚未通过，暂不进入下一节。
+
+2026-09-14 第三课：已完成 ToolInvocation 的源码链路课文。当前已核验 ResponseItem -> ToolCall -> handle_output_item_done -> ToolCallRuntime -> ToolRouter -> ToolRegistry -> ToolExecutorFuture -> drain_in_flight；已区分 ToolCall 的模型请求表示与 ToolInvocation 的运行时上下文；已说明 StepContext 的环境/能力快照、child cancellation token、并行 admission、history/rollout 记录以及 call_id 不提供 exactly-once。当前仅为静态源码核验，第三课三道练习尚未验收。
 
 2026-09-11 第二课更新：学习者对第一课简单场景回答“1个turn，请求了2次模型，tool result”，三项正确。验收范围仅为该场景中 Turn、模型请求次数与工具结果的区分；不据此认定恢复、幂等或源码阅读已经掌握。第二课进入模型与 Runtime 分工、ToolExecutor 契约及工具路由/参数解析，作为 P0 到 P1 的桥接，不提前展开完整 P4 工具系统。新课文与正式答复要求逐字相同，已有课文与问答不回改。
 
