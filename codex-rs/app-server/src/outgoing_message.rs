@@ -46,6 +46,10 @@ pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorEr
 static IN_FLIGHT_REQUESTS: Gauge = Gauge::new("app.requests.in_flight");
 static PENDING_SERVER_REQUESTS: Gauge = Gauge::new("app.server_requests.pending");
 
+#[path = "account_notifications.rs"]
+mod account_notifications;
+pub(crate) use account_notifications::AccountNotification;
+
 #[path = "user_verification_auth.rs"]
 mod user_verification_auth;
 
@@ -744,6 +748,14 @@ impl OutgoingMessageSender {
         }
         self.send_server_notification_to_connections(&[], notification)
             .await;
+    }
+
+    pub(crate) fn try_send_server_notification(&self, notification: ServerNotification) {
+        if let Err(error) = self.sender.try_send(OutgoingEnvelope::Broadcast {
+            message: timestamped_server_notification(notification),
+        }) {
+            warn!("failed to queue server notification to clients: {error}");
+        }
     }
 
     pub(crate) async fn send_server_notification_to_connections(

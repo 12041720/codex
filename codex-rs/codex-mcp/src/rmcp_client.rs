@@ -4,6 +4,7 @@
 //! initializing the server, listing raw tools, applying per-server tool filters,
 //! and exposing cached Codex Apps tools while a client is still connecting.
 //! Initialization capabilities survive tool-discovery failures and reset on a new attempt.
+//! Executor-discovered environment credentials remain executor-bound across those attempts.
 //! Higher-level aggregation and resource/tool APIs live in
 //! [`crate::connection_manager`].
 
@@ -36,6 +37,7 @@ use crate::pagination::collect_paginated_with_limit;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
 use crate::server::EffectiveMcpServer;
+use crate::server::McpCredentialPolicy;
 use crate::server::has_explicit_http_authorization;
 use crate::tool_catalog_cache::McpToolCatalogCacheContext;
 use crate::tool_catalog_cache::McpToolCatalogFetchTicket;
@@ -146,7 +148,7 @@ impl ManagedClient {
                         return tools;
                     }
                 }
-                catalog.tools.clone()
+                catalog.tools.to_vec()
             })
             .await
     }
@@ -367,7 +369,9 @@ impl ManagedClientStartup {
                 )
                 .await
                 {
-                    Ok(result) => Arc::new(result?),
+                    Ok(result) => Arc::new(
+                        result?.with_read_only_tools(server.requires_read_only_mcp_tools()),
+                    ),
                     Err(_) => {
                         return Err(StartupOutcomeError::from(anyhow!(
                             "MCP client startup timed out after {startup_timeout:?}"
@@ -868,10 +872,17 @@ fn is_untrusted_connector_meta_key(key: &str) -> bool {
 fn resolve_bearer_token(
     server_name: &str,
     bearer_token_env_var: Option<&str>,
+    credential_policy: McpCredentialPolicy,
 ) -> Result<Option<String>> {
     let Some(env_var) = bearer_token_env_var else {
         return Ok(None);
     };
+
+    if credential_policy == McpCredentialPolicy::ExecutorOnly {
+        return Err(anyhow!(
+            "MCP server '{server_name}' requires executor-side environment credential resolution; update the executor to a version that supports it (host fallback is disabled)"
+        ));
+    }
 
     match env::var(env_var) {
         Ok(value) => {
@@ -938,6 +949,7 @@ async fn start_server_task(
             );
     }
 
+    let requested_capabilities = params.capabilities.clone();
     let started_at = Instant::now();
     let initialize_result = client
         .initialize(params, startup_timeout, send_elicitation)
@@ -981,11 +993,30 @@ async fn start_server_task(
         .as_ref()
         .and_then(|exp| exp.get(MCP_SANDBOX_STATE_META_CAPABILITY))
         .is_some();
+    let codex_apps_tools_cache_context = codex_apps_tools_cache_context.map(|context| {
+        if server_disables_tool_catalog_cache {
+            context.without_live_scope()
+        } else {
+            // Converted tools can inherit these instructions. Server capabilities and the
+            // negotiated protocol can also differ between otherwise identical connections.
+            let mut scope = serde_json::json!([
+                requested_capabilities,
+                initialize_result.protocol_version,
+                initialize_result.capabilities,
+                initialize_result.instructions,
+                initialize_result.server_info,
+            ]);
+            scope.sort_all_objects();
+            context.with_live_scope(scope.to_string())
+        }
+    });
     let list_start = Instant::now();
+    let server_info =
+        mcp_server_info_from_implementation(&server_name, initialize_result.server_info);
     let fetch_ticket = codex_apps_tools_cache_context
         .as_ref()
-        .map(|cache_context| cache_context.begin_fetch(ConnectorRuntimeFetchSource::Startup));
-    let client_tools = list_tools_for_client_uncached(
+        .map(|context| context.begin_fetch(ConnectorRuntimeFetchSource::Startup));
+    let tools = list_tools_for_client_uncached(
         &server_name,
         is_codex_apps_mcp_server,
         /*codex_apps_refresh_trigger*/ "initial",
@@ -996,25 +1027,25 @@ async fn start_server_task(
     )
     .await
     .map_err(StartupOutcomeError::from)?;
-    let server_info =
-        mcp_server_info_from_implementation(&server_name, initialize_result.server_info);
-    let shared_tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
-        (Some(cache_context), Some(fetch_ticket)) => cache_context.publish_if_newest_accepted(
-            fetch_ticket,
-            &server_info,
-            client_tools.clone(),
-        ),
-        (None, None) => client_tools.clone(),
-        _ => unreachable!("Codex Apps fetch ticket requires cache context"),
-    };
-    let has_shared_tool_catalog = is_codex_apps_mcp_server || tool_catalog_cache_context.is_some();
+    let client_tools: Arc<[ToolInfo]> =
+        match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
+            (Some(context), Some(ticket)) if server_disables_tool_catalog_cache => {
+                context.publish_runtime_if_newest_accepted(ticket, &server_info, tools.clone());
+                tools.into()
+            }
+            (Some(context), Some(ticket)) => context
+                .publish_runtime_if_newest_accepted(ticket, &server_info, tools)
+                .shared_tools(),
+            (None, None) => tools.into(),
+            _ => unreachable!("Codex Apps fetch ticket requires cache context"),
+        };
     if let (Some(cache_context), Some(fetch_ticket)) = (
         tool_catalog_cache_context.as_ref(),
         tool_catalog_fetch_ticket,
     ) {
-        cache_context.publish_if_newest(fetch_ticket, &shared_tools);
+        cache_context.publish_if_newest(fetch_ticket, &client_tools);
     }
-    if has_shared_tool_catalog {
+    if is_codex_apps_mcp_server || tool_catalog_cache_context.is_some() {
         emit_duration(
             MCP_TOOLS_LIST_DURATION_METRIC,
             list_start.elapsed(),
@@ -1145,6 +1176,23 @@ pub(crate) async fn make_rmcp_client(
     protocol_mode: McpProtocolMode,
 ) -> Result<RmcpClient, StartupOutcomeError> {
     let config = server.config().clone();
+    if server.credential_policy() == McpCredentialPolicy::ExecutorOnly {
+        // Executor HTTP declarations cannot acquire host header helpers through
+        // cached registration materialization.
+        let valid_transport = matches!(
+            &config.transport,
+            McpServerTransportConfig::StreamableHttp {
+                env_http_headers,
+                http_headers_helper: None,
+                ..
+            } if env_http_headers.as_ref().is_none_or(HashMap::is_empty)
+        );
+        if config.is_local_environment() || !valid_transport {
+            return Err(StartupOutcomeError::from(anyhow!(
+                "executor-discovered MCP server '{server_name}' requires a remote HTTP transport without host environment headers or helpers"
+            )));
+        }
+    }
     if matches!(config.auth, McpServerAuth::EmaAuth) {
         return Err(StartupOutcomeError::from(anyhow!(
             "EMA MCP connections are not enabled in this version"
@@ -1249,9 +1297,13 @@ pub(crate) async fn make_rmcp_client(
                     Some(StreamableHttpBearerToken::ProvidedByHttpClient),
                 )
             } else {
-                let token = resolve_bearer_token(server_name, bearer_token_env_var.as_deref())
-                    .map_err(StartupOutcomeError::from)?
-                    .map(StreamableHttpBearerToken::Resolved);
+                let token = resolve_bearer_token(
+                    server_name,
+                    bearer_token_env_var.as_deref(),
+                    server.credential_policy(),
+                )
+                .map_err(StartupOutcomeError::from)?
+                .map(StreamableHttpBearerToken::Resolved);
                 (http_client, token)
             };
             let redirect_mode = if server.is_agent_plugin() {
@@ -1265,6 +1317,7 @@ pub(crate) async fn make_rmcp_client(
                 resolved_bearer_token,
                 http_headers,
                 env_http_headers,
+                server.config().oauth.clone(),
                 store_mode,
                 keyring_backend_kind,
                 http_client,
@@ -1453,3 +1506,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "rmcp_client_credential_policy_tests.rs"]
+mod credential_policy_tests;

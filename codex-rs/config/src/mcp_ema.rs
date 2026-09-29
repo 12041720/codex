@@ -139,10 +139,44 @@ impl McpServerConfig {
         self.oauth.as_ref()?.ema_registration.as_ref()
     }
 
+    /// Called once on a materialized catalog, after configuration provenance and
+    /// plugin endpoint policy have been checked. Runtime consumers use the result.
+    pub fn resolve_ema_registration(
+        &mut self,
+        idp: &McpServerIdpOAuthConfig,
+    ) -> Result<(), &'static str> {
+        if let Some(oauth) = &mut self.oauth {
+            oauth.ema_registration = None;
+            if let Some(error) = oauth.ema_registration_error {
+                return Err(error);
+            }
+        }
+        if !matches!(self.auth, crate::McpServerAuth::EmaAuth) {
+            return Err("enterprise registration requires ema_auth");
+        }
+        self.validate_ema_auth_transport()?;
+        let McpServerTransportConfig::StreamableHttp { url, .. } = &self.transport else {
+            unreachable!("EMA transport was validated");
+        };
+        let oauth = self.oauth.get_or_insert_default();
+        oauth.ema_registration = Some(McpEmaRegistration {
+            idp: idp.clone(),
+            server_url: url.clone(),
+            resource: self.oauth_resource.clone(),
+            client_id: oauth.client_id.clone(),
+            authorization_server_issuer: oauth.authorization_server_issuer.clone(),
+            scopes: self.scopes.clone().unwrap_or_default(),
+        });
+        Ok(())
+    }
+
     /// EMA never falls back to an unrelated bearer or executor-owned credential.
     pub fn validate_ema_auth_transport(&self) -> Result<(), &'static str> {
         if !self.is_local_environment() {
             return Err("ema_auth requires a host-owned MCP connection");
+        }
+        if self.oauth_client_secret().is_some() {
+            return Err("ema_auth cannot be combined with oauth.client_secret");
         }
         let McpServerTransportConfig::StreamableHttp {
             bearer_token_env_var,

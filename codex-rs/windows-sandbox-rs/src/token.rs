@@ -20,7 +20,6 @@ use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::CopySid;
 use windows_sys::Win32::Security::CreateRestrictedToken;
 use windows_sys::Win32::Security::CreateWellKnownSid;
-use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
 use windows_sys::Win32::Security::IsValidSid;
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
@@ -36,10 +35,8 @@ use windows_sys::Win32::Security::TOKEN_DUPLICATE;
 use windows_sys::Win32::Security::TOKEN_GROUPS;
 use windows_sys::Win32::Security::TOKEN_PRIVILEGES;
 use windows_sys::Win32::Security::TOKEN_QUERY;
-use windows_sys::Win32::Security::TOKEN_USER;
 use windows_sys::Win32::Security::TokenDefaultDacl;
 use windows_sys::Win32::Security::TokenGroups;
-use windows_sys::Win32::Security::TokenUser;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
@@ -54,27 +51,32 @@ struct TokenDefaultDaclInfo {
     default_dacl: *mut ACL,
 }
 
-/// Sets a permissive default DACL so sandboxed processes can create pipes/IPC objects
-/// without hitting ACCESS_DENIED when PowerShell builds pipelines.
-unsafe fn set_default_dacl(h_token: HANDLE, sids: &[*mut c_void]) -> Result<()> {
-    if sids.is_empty() {
-        return Ok(());
-    }
-    let entries: Vec<EXPLICIT_ACCESS_W> = sids
-        .iter()
-        .map(|sid| EXPLICIT_ACCESS_W {
-            grfAccessPermissions: GENERIC_ALL,
-            grfAccessMode: GRANT_ACCESS,
-            grfInheritance: 0,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation: 0,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN,
-                ptstrName: *sid as *mut u16,
-            },
-        })
-        .collect();
+/// Keep child-process and IPC access within the runner's logon session.
+/// Elevated runners have distinct logon SIDs even when they use the same account.
+unsafe fn set_default_dacl(h_token: HANDLE, logon_sid: *mut c_void) -> Result<()> {
+    let owner_rights = LocalSid::from_string("S-1-3-4")?;
+    // The shared account also owns these objects. An OWNER RIGHTS ACE suppresses
+    // its implicit WRITE_DAC grant, which would otherwise let a different logon
+    // rewrite this DACL. The creating logon retains full access explicitly.
+    let entries = [
+        (logon_sid, GENERIC_ALL),
+        (
+            owner_rights.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+        ),
+    ]
+    .map(|(sid, access)| EXPLICIT_ACCESS_W {
+        grfAccessPermissions: access,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid as *mut u16,
+        },
+    });
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
     let res = SetEntriesInAclW(
         entries.len() as u32,
@@ -196,7 +198,7 @@ pub unsafe fn get_current_token_for_restriction() -> Result<HANDLE> {
 
 /// An owned token group, including attributes such as enabled and deny-only.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TokenGroup {
+pub struct TokenGroup {
     pub sid: Vec<u8>,
     pub attributes: u32,
 }
@@ -205,7 +207,7 @@ pub(crate) struct TokenGroup {
 ///
 /// # Safety
 /// `token` must remain a valid token handle with `TOKEN_QUERY` access during this call.
-pub(crate) unsafe fn token_groups(token: HANDLE, max_bytes: u32) -> Result<Vec<TokenGroup>> {
+pub unsafe fn token_groups(token: HANDLE, max_bytes: u32) -> Result<Vec<TokenGroup>> {
     let mut needed = 0;
     GetTokenInformation(token, TokenGroups, std::ptr::null_mut(), 0, &mut needed);
     ensure!(
@@ -332,45 +334,7 @@ pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
     Err(anyhow!("Logon SID not present on token"))
 }
 
-pub(crate) unsafe fn get_user_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
-    let mut needed: u32 = 0;
-    GetTokenInformation(h_token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
-    if needed == 0 {
-        return Err(anyhow!("TokenUser size query returned 0"));
-    }
-    let mut user_buf: Vec<u8> = vec![0u8; needed as usize];
-    let ok = GetTokenInformation(
-        h_token,
-        TokenUser,
-        user_buf.as_mut_ptr() as *mut c_void,
-        needed,
-        &mut needed,
-    );
-    if ok == 0 || (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
-        return Err(anyhow!(
-            "GetTokenInformation(TokenUser) failed: {}",
-            GetLastError()
-        ));
-    }
-    let token_user: TOKEN_USER = std::ptr::read_unaligned(user_buf.as_ptr() as *const TOKEN_USER);
-    let sid_len = GetLengthSid(token_user.User.Sid);
-    if sid_len == 0 {
-        return Err(anyhow!(
-            "GetLengthSid(TokenUser) failed: {}",
-            GetLastError()
-        ));
-    }
-    let mut user_sid_bytes = vec![0u8; sid_len as usize];
-    if CopySid(
-        sid_len,
-        user_sid_bytes.as_mut_ptr() as *mut c_void,
-        token_user.User.Sid,
-    ) == 0
-    {
-        return Err(anyhow!("CopySid(TokenUser) failed: {}", GetLastError()));
-    }
-    Ok(user_sid_bytes)
-}
+pub(crate) use crate::token_user::get_user_sid_bytes;
 
 unsafe fn enable_single_privilege(h_token: HANDLE, name: &str) -> Result<()> {
     let mut luid = LUID {
@@ -549,15 +513,14 @@ unsafe fn create_token_with_caps_from(
         return Err(anyhow!("CreateRestrictedToken failed: {}", GetLastError()));
     }
 
-    // Additional restricting SIDs are identity markers, not capabilities. Deliberately exclude
-    // them from the default DACL so possessing a route identity cannot grant object access.
-    let mut dacl_sids: Vec<*mut c_void> = Vec::with_capacity(psid_capabilities.len() + 2);
-    dacl_sids.push(psid_logon);
-    dacl_sids.push(psid_everyone);
-    dacl_sids.extend_from_slice(psid_capabilities);
-    set_default_dacl(new_token, &dacl_sids)?;
-
-    enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
+    // Filesystem and route capabilities may be shared between launches. They
+    // must not grant access to another launch's processes, threads, or IPC.
+    if let Err(error) = set_default_dacl(new_token, psid_logon)
+        .and_then(|()| enable_single_privilege(new_token, "SeChangeNotifyPrivilege"))
+    {
+        CloseHandle(new_token);
+        return Err(error);
+    }
     Ok(new_token)
 }
 
